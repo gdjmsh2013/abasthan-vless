@@ -1,0 +1,16 @@
+{
+  "dependencies": {
+    "adm-zip": "0.5.16"
+  },
+  "description": "VLESS + WebSocket node for Abasthan (Node launcher downloads and runs Xray-core + cloudflared)",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "index.js",
+  "name": "abasthan-vless",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "version": "1.0.0"
+}
