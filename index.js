@@ -1,22 +1,32 @@
 // VLESS + WebSocket node launcher for Abasthan.
-// The node is reached through a Cloudflare Tunnel whose public hostname
-// (infrlo.jms.indevs.in) points to http://localhost:5000, so Xray listens
-// on port 5000 for the tunnel and also on the platform-provided PORT
-// (when different) so the platform sees its expected port bound.
+//
+// Layout (v2): Xray listens on an internal port only (127.0.0.1:5001).
+// A small Node front proxy listens on the public ports (5000 = the
+// Cloudflare Tunnel target, 9400 = the port Abasthan assigns/routes,
+// plus the platform-provided PORT when different). The proxy answers
+// non-WS requests with 200 "ok" (platform health checks kept the v1
+// app in a restart loop because Xray only ever returns 404/400) and
+// relays the WS path to Xray, for both plain HTTP and Upgrade requests.
+//
 // Required env var: UUID (set it in the app's environment variables,
 // never commit it).
 // Optional env vars: PORT (platform-provided), WS_PATH (default /ws),
 // ARGO_TOKEN (Cloudflare Tunnel token; when set, cloudflared is also
-// started so the node is reachable through the tunnel's public hostname).
+// started. NOTE: on Abasthan free instances outbound TCP/UDP 7844 to
+// the Cloudflare edge appears blocked (cloudflared precheck hard-fails),
+// so the tunnel may never register there; the node is then reached
+// directly through the platform subdomain instead.)
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const net = require('net');
 const { spawn } = require('child_process');
 
-const PORT = parseInt(process.env.PORT || '5000', 10);
-const TUNNEL_PORT = 5000;
-const PORTS = [...new Set([PORT, TUNNEL_PORT])];
+const PORT = parseInt(process.env.PORT || '0', 10);
+const XRAY_PORT = 5001;
+const FRONT_PORTS = [...new Set([5000, 9400, PORT].filter((p) => p && p !== XRAY_PORT))];
 const UUID = process.env.UUID;
 const WS_PATH = process.env.WS_PATH || '/ws';
 const ARGO_TOKEN = process.env.ARGO_TOKEN || '';
@@ -90,21 +100,23 @@ function writeConfig() {
       servers: ['1.1.1.1', '8.8.8.8'],
       queryStrategy: 'UseIPv4',
     },
-    inbounds: PORTS.map((p) => ({
-      listen: '0.0.0.0',
-      port: p,
-      protocol: 'vless',
-      settings: {
-        clients: [{ id: UUID }],
-        decryption: 'none',
+    inbounds: [
+      {
+        listen: '127.0.0.1',
+        port: XRAY_PORT,
+        protocol: 'vless',
+        settings: {
+          clients: [{ id: UUID }],
+          decryption: 'none',
+        },
+        streamSettings: {
+          network: 'ws',
+          security: 'none',
+          wsSettings: { path: WS_PATH },
+        },
+        sniffing: { enabled: true, destOverride: ['http', 'tls'] },
       },
-      streamSettings: {
-        network: 'ws',
-        security: 'none',
-        wsSettings: { path: WS_PATH },
-      },
-      sniffing: { enabled: true, destOverride: ['http', 'tls'] },
-    })),
+    ],
     outbounds: [
       { protocol: 'freedom', tag: 'direct', settings: { domainStrategy: 'UseIPv4' } },
       { protocol: 'blackhole', tag: 'blocked' },
@@ -115,23 +127,83 @@ function writeConfig() {
   return cfgPath;
 }
 
+// --- front proxy ---------------------------------------------------------
+// Answers platform health checks with 200 and relays WS_PATH traffic to
+// Xray on the internal port.
+function isWsPath(url) {
+  const q = url.indexOf('?');
+  return (q === -1 ? url : url.slice(0, q)) === WS_PATH;
+}
+
+function startFrontProxy() {
+  for (const port of FRONT_PORTS) {
+    const server = http.createServer((req, res) => {
+      if (!isWsPath(req.url)) {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('ok');
+        return;
+      }
+      const upstream = http.request(
+        {
+          host: '127.0.0.1',
+          port: XRAY_PORT,
+          path: req.url,
+          method: req.method,
+          headers: req.headers,
+        },
+        (up) => {
+          res.writeHead(up.statusCode || 502, up.headers);
+          up.pipe(res);
+        }
+      );
+      upstream.on('error', () => {
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end('bad gateway');
+      });
+      req.pipe(upstream);
+    });
+    server.on('upgrade', (req, socket, head) => {
+      if (!isWsPath(req.url)) {
+        socket.destroy();
+        return;
+      }
+      const upstream = net.connect(XRAY_PORT, '127.0.0.1', () => {
+        let raw = req.method + ' ' + req.url + ' HTTP/' + req.httpVersion + '\r\n';
+        for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
+          raw += req.rawHeaders[i] + ': ' + req.rawHeaders[i + 1] + '\r\n';
+        }
+        raw += '\r\n';
+        upstream.write(raw);
+        if (head && head.length) upstream.write(head);
+        upstream.pipe(socket);
+        socket.pipe(upstream);
+      });
+      upstream.on('error', () => socket.destroy());
+      socket.on('error', () => upstream.destroy());
+    });
+    server.on('error', (err) => console.error('front proxy on ' + port + ' failed: ' + err.message));
+    server.listen(port, '0.0.0.0', () => console.log('Front proxy listening on port ' + port));
+  }
+}
+
 // --- cloudflared supervision -------------------------------------------
 // On the previous host (2026-11-15) the tunnel died silently: cloudflared
 // never logged a disconnect, but its attempts to refresh the container's
-// local DNS resolver kept timing out and the tunnel never re-registered,
-// leaving the public hostname at Cloudflare 530 while the app showed
-// Running. Two defences:
+// local DNS resolver kept timing out and the tunnel never re-registered.
+// Two defences:
 // 1) Resolve the tunnel edge IPs ourselves through 1.1.1.1/8.8.8.8
-//    (bypassing the container resolver) and pass them via --edge, so
-//    cloudflared does not need the container DNS to reach the edge.
+//    (bypassing the container resolver) and pass them via --edge.
 // 2) Poll cloudflared's metrics /ready endpoint; if it reports no
-//    registered connections for 3 checks in a row, kill it so the
-//    supervisor restarts and re-registers it.
+//    registered connections for many checks in a row, kill it so the
+//    supervisor restarts and re-registers it. The threshold is generous
+//    (10 checks) because on hosts where outbound 7844 is blocked the
+//    tunnel can never register and constant restarts only waste CPU.
 let cfProc = null;
 let cfUseEdge = true;
 let cfRapidExits = 0;
 let cfStartedAt = 0;
 let cfBadChecks = 0;
+const CF_BAD_LIMIT = 10;
 
 async function resolveEdgeAddrs() {
   const { Resolver } = require('dns').promises;
@@ -207,7 +279,6 @@ async function startCloudflared() {
 }
 
 function startCfMonitor() {
-  const http = require('http');
   setInterval(() => {
     if (!cfProc) return; // the exit handler is already restarting it
     let settled = false;
@@ -228,10 +299,17 @@ function startCfMonitor() {
         }
         cfBadChecks += 1;
         console.log(
-          'cloudflared health check bad (' + cfBadChecks + '/3): HTTP ' + res.statusCode + ', readyConnections ' + ready
+          'cloudflared health check bad (' +
+            cfBadChecks +
+            '/' +
+            CF_BAD_LIMIT +
+            '): HTTP ' +
+            res.statusCode +
+            ', readyConnections ' +
+            ready
         );
-        if (cfBadChecks >= 3 && cfProc) {
-          console.log('cloudflared unhealthy 3 checks in a row; killing it so it re-registers.');
+        if (cfBadChecks >= CF_BAD_LIMIT && cfProc) {
+          console.log('cloudflared unhealthy ' + CF_BAD_LIMIT + ' checks in a row; killing it so it re-registers.');
           cfBadChecks = 0;
           cfProc.kill('SIGKILL');
         }
@@ -241,9 +319,9 @@ function startCfMonitor() {
     req.on('error', (err) => {
       if (settled) return;
       cfBadChecks += 1;
-      console.log('cloudflared health check error (' + cfBadChecks + '/3): ' + err.message);
-      if (cfBadChecks >= 3 && cfProc) {
-        console.log('cloudflared unreachable 3 checks in a row; killing it so it re-registers.');
+      console.log('cloudflared health check error (' + cfBadChecks + '/' + CF_BAD_LIMIT + '): ' + err.message);
+      if (cfBadChecks >= CF_BAD_LIMIT && cfProc) {
+        console.log('cloudflared unreachable ' + CF_BAD_LIMIT + ' checks in a row; killing it so it re-registers.');
         cfBadChecks = 0;
         cfProc.kill('SIGKILL');
       }
@@ -254,7 +332,7 @@ function startCfMonitor() {
 (async () => {
   await ensureXray();
   const cfgPath = writeConfig();
-  console.log('Starting Xray: VLESS+WS on port(s) ' + PORTS.join(', ') + ', path ' + WS_PATH);
+  console.log('Starting Xray: VLESS+WS on internal port ' + XRAY_PORT + ', path ' + WS_PATH);
   const child = spawn(XRAY_BIN, ['run', '-config', cfgPath], { stdio: 'inherit' });
   child.on('exit', (code) => {
     console.log('Xray exited with code ' + code);
@@ -263,6 +341,9 @@ function startCfMonitor() {
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => child.kill(sig));
   }
+
+  startFrontProxy();
+  console.log('Front proxy ports: ' + FRONT_PORTS.join(', ') + ' -> Xray ' + XRAY_PORT);
 
   if (ARGO_TOKEN) {
     try {
